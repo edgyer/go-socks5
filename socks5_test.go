@@ -1,6 +1,7 @@
 package socks5
 
 import (
+	"bufio"
 	"bytes"
 	"encoding/binary"
 	"io"
@@ -10,6 +11,33 @@ import (
 	"testing"
 	"time"
 )
+
+
+func TestParseHeader(t *testing.T) {
+
+	// Create the connect request
+	buf := bytes.NewBuffer(nil)
+	buf.Write([]byte{5, 1, 0, 1, 127, 0, 0, 1})
+
+	port := []byte{0, 0}
+	l, err := net.Listen("tcp", "127.0.0.1:0")
+	if err != nil {
+		t.Fatalf("err: %v", err)
+	}
+	lAddr := l.Addr().(*net.TCPAddr)
+	binary.BigEndian.PutUint16(port, uint16(lAddr.Port))
+	buf.Write(port)
+
+	// Send a ping
+	buf.Write([]byte("ping"))
+
+	// Treat headers
+	r := bufio.NewReader(buf)
+	_,_,err = Parse(r)
+	if err != nil {
+		t.Fatalf("err: %v", err)
+	}
+}
 
 func TestSOCKS5_Connect(t *testing.T) {
 	// Create a local listener
@@ -24,15 +52,18 @@ func TestSOCKS5_Connect(t *testing.T) {
 		}
 		defer conn.Close()
 
-		buf := make([]byte, 4)
-		if _, err := io.ReadAtLeast(conn, buf, 4); err != nil {
+		r := bufio.NewReader(conn)
+		_,payload, err := Parse(r)
+		if err != nil {
 			t.Fatalf("err: %v", err)
 		}
-
-		if !bytes.Equal(buf, []byte("ping")) {
-			t.Fatalf("bad: %v", buf)
+		if !bytes.Equal(payload, []byte("ping")) {
+			t.Fatalf("bad: %v", payload)
 		}
-		conn.Write([]byte("pong"))
+		_,err = conn.Write([]byte("pong"))
+		if err != nil {
+			t.Fatalf("err: %v", err)
+		}
 	}()
 	lAddr := l.Addr().(*net.TCPAddr)
 
@@ -52,7 +83,8 @@ func TestSOCKS5_Connect(t *testing.T) {
 
 	// Start listening
 	go func() {
-		if err := serv.ListenAndServe("tcp", "127.0.0.1:12365"); err != nil {
+		nl := make(chan net.Listener)
+		if err := serv.ListenAndServe("tcp", "127.0.0.1:12365", nl); err != nil {
 			t.Fatalf("err: %v", err)
 		}
 	}()
@@ -79,7 +111,9 @@ func TestSOCKS5_Connect(t *testing.T) {
 	req.Write([]byte("ping"))
 
 	// Send all the bytes
-	conn.Write(req.Bytes())
+	if _, err := conn.Write(req.Bytes());err!=nil{
+		t.Fatalf("err: %v", err)
+	}
 
 	// Verify response
 	expected := []byte{
@@ -95,7 +129,9 @@ func TestSOCKS5_Connect(t *testing.T) {
 	}
 	out := make([]byte, len(expected))
 
-	conn.SetDeadline(time.Now().Add(time.Second))
+	if err := conn.SetDeadline(time.Now().Add(time.Second));err!=nil{
+		t.Fatalf("err: %v", err)
+	}
 	if _, err := io.ReadAtLeast(conn, out, len(out)); err != nil {
 		t.Fatalf("err: %v", err)
 	}

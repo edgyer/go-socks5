@@ -9,13 +9,33 @@ import (
 	"strings"
 )
 
+
+
 const (
 	ConnectCommand   = uint8(1)
 	BindCommand      = uint8(2)
-	AssociateCommand = uint8(3)
+	AssociateCommand = uint8(3) // only avaliable in socks5
 	ipv4Address      = uint8(1)
 	fqdnAddress      = uint8(3)
 	ipv6Address      = uint8(4)
+
+	// common fields
+	reqProtocolVersionBytePos = uint8(0) // proto version pos
+	reqCommandBytePos         = uint8(1)
+	reqAddrBytePos            = uint8(4)
+	reqStartLen               = uint8(4)
+
+	reqVersionLen  = 1
+	reqCommandLen  = 1
+	reqPortLen     = 2
+	reqReservedLen = 1
+	reqAddrTypeLen = 1
+	reqIPv4Addr    = 4
+	reqIPv6Addr    = 8
+	reqFQDNAddr    = 249
+
+	//position settings for socks4
+	req4PortBytePos = uint8(2)
 )
 
 const (
@@ -31,7 +51,7 @@ const (
 )
 
 var (
-	unrecognizedAddrType = fmt.Errorf("Unrecognized address type")
+	unrecognizedAddrType = fmt.Errorf("unrecognized address type")
 )
 
 // AddressRewriter is used to rewrite a destination transparently
@@ -40,13 +60,14 @@ type AddressRewriter interface {
 }
 
 // AddrSpec is used to return the target AddrSpec
-// which may be specified as IPv4, IPv6, or a FQDN
+// which may be specified as IPv4, IPv6, or a FQDN (fully qualified domain name)
 type AddrSpec struct {
 	FQDN string
 	IP   net.IP
 	Port int
 }
 
+// String() Sprints AddrSpec
 func (a *AddrSpec) String() string {
 	if a.FQDN != "" {
 		return fmt.Sprintf("%s (%s):%d", a.FQDN, a.IP, a.Port)
@@ -65,6 +86,8 @@ func (a AddrSpec) Address() string {
 
 // A Request represents request received by a server
 type Request struct {
+	// Headers
+	Headers Header
 	// Protocol version
 	Version uint8
 	// Requested command
@@ -86,72 +109,23 @@ type conn interface {
 }
 
 // NewRequest creates a new Request from the tcp connection
-func NewRequest(bufConn io.Reader, reqVersion byte) (*Request, error) {
+func NewRequest(header Header, bufConn io.Reader,authContext AuthContext) (*Request, error) {
+	addr := header.Address
 	request := &Request{
-		Version: reqVersion,
-		bufConn: bufConn,
+		Headers: header,
+		Version:  header.Version,
+		Command:  header.Command,
+		DestAddr: &addr,
+		bufConn:  bufConn,
 	}
-
-	if reqVersion == socks5Version {
-		header := []byte{0, 0, 0}
-		// Read the version byte
-		if _, err := io.ReadAtLeast(bufConn, header, 3); err != nil {
-			return nil, fmt.Errorf("Failed to get command version: %v", err)
-		}
-
-		// Ensure we are compatible
-		if reqVersion == socks5Version {
-			header := []byte{0, 0, 0}
-			// Read the version byte
-			if _, err := io.ReadAtLeast(bufConn, header, 3); err != nil {
-				return nil, fmt.Errorf("Failed to get command version: %v", err)
-			}
-		}
-
-		request.Command = header[1]
-
-		var err error
-		// Read in the destination address
-		request.DestAddr, err = readAddrSpec(bufConn)
-		if err != nil {
-			return nil, err
-		}
-	} else {
-		header := []byte{0}
-		// Read the command byte
-		if _, err := io.ReadAtLeast(bufConn, header, 1); err != nil {
-			return nil, fmt.Errorf("Failed to get command: %v", err)
-		}
-
-		// Ensure we are compatible
-		if header[0] != socks5Version {
-			return nil, fmt.Errorf("Unsupported command version: %v", header[0])
-		}
-		request.Command = header[0]
-
-		var err error
-		// Read in the destination address
-		request.DestAddr, err = readAddrSpecv4(bufConn)
-		if err != nil {
-			return nil, err
-		}
-
-		authStr := make([]byte, 256)
-		n, err := io.ReadAtLeast(bufConn, authStr, 1)
-		if err != nil {
-			return nil, fmt.Errorf("Failed to get auth string: %v", err)
-		}
-
-		if n > 0 {
-			request.AuthContext = &AuthContext{UserPassAuth, map[string]string{"Username": string(authStr[:n-1])}}
-		}
+	if authContext.IsActive() && header.Version != socks4Version{
+		request.AuthContext = &authContext
 	}
-
 	return request, nil
 }
 
 // handleRequest is used for request processing after authentication
-func (s *Server) handleRequest(req *Request, conn conn) error {
+func (s *Server) handleRequest(req *Request, conn conn)(err error){
 	ctx := context.Background()
 
 	// Resolve the address if we have a FQDN
@@ -159,45 +133,35 @@ func (s *Server) handleRequest(req *Request, conn conn) error {
 	if dest.FQDN != "" {
 		nctx, addr, err := s.config.Resolver.Resolve(ctx, dest.FQDN)
 		if err != nil {
-			if err := sendReply(conn, hostUnreachable, nil, req.Version); err != nil {
-				return fmt.Errorf("Failed to send reply: %v", err)
+			if err := sendReply(conn, hostUnreachable, req.Headers); err != nil {
+				return fmt.Errorf("failed to send reply: %v", err)
 			}
-			return fmt.Errorf("Failed to resolve destination '%v': %v", dest.FQDN, err)
+			return fmt.Errorf("failed to resolve destination '%v': %v", dest.FQDN, err)
 		}
 		ctx = nctx
 		dest.IP = addr
 	}
-
 	// Apply any address rewrites
 	req.realDestAddr = req.DestAddr
 	if s.config.Rewriter != nil {
 		ctx, req.realDestAddr = s.config.Rewriter.Rewrite(ctx, req)
 	}
 
-	// Switch on the command
-	switch req.Command {
-	case ConnectCommand:
-		return s.handleConnect(ctx, conn, req)
-	case BindCommand:
-		return s.handleBind(ctx, conn, req)
-	case AssociateCommand:
-		return s.handleAssociate(ctx, conn, req)
-	default:
-		if err := sendReply(conn, commandNotSupported, nil, req.Version); err != nil {
-			return fmt.Errorf("Failed to send reply: %v", err)
-		}
-		return fmt.Errorf("Unsupported command: %v", req.Command)
+	if err := s.handlers[req.Command](ctx,conn,req);err != nil{
+		return fmt.Errorf("request handling error: %v",err)
 	}
+
+	return nil
 }
 
 // handleConnect is used to handle a connect command
-func (s *Server) handleConnect(ctx context.Context, conn conn, req *Request) error {
+func (s *Server) handleConnect(ctx context.Context, conn conn, req *Request)(err error) {
 	// Check if this is allowed
 	if nctx, ok := s.config.Rules.Allow(ctx, req); !ok {
-		if err := sendReply(conn, ruleFailure, nil, req.Version); err != nil {
-			return fmt.Errorf("Failed to send reply: %v", err)
+		if err := sendReply(conn, ruleFailure, req.Headers); err != nil {
+			return fmt.Errorf("failed to send reply: %v", err)
 		}
-		return fmt.Errorf("Connect to %v blocked by rules", req.DestAddr)
+		return fmt.Errorf("connect to %v blocked by rules", req.DestAddr)
 	} else {
 		ctx = nctx
 	}
@@ -219,10 +183,10 @@ func (s *Server) handleConnect(ctx context.Context, conn conn, req *Request) err
 		} else if strings.Contains(msg, "network is unreachable") {
 			resp = networkUnreachable
 		}
-		if err := sendReply(conn, resp, nil, req.Version); err != nil {
-			return fmt.Errorf("Failed to send reply: %v", err)
+		if err := sendReply(conn, resp, req.Headers); err != nil {
+			return fmt.Errorf("failed to send reply: %v", err)
 		}
-		return fmt.Errorf("Connect to %v failed: %v", req.DestAddr, err)
+		return fmt.Errorf("connect to %v failed: %v", req.DestAddr, err)
 	}
 	defer target.Close()
 
@@ -230,8 +194,9 @@ func (s *Server) handleConnect(ctx context.Context, conn conn, req *Request) err
 	//if err := sendReply(conn, successReply, addrSpecFromNetAddr(target.LocalAddr())); err != nil {
 	local := target.LocalAddr().(*net.TCPAddr)
 	bind := AddrSpec{IP: local.IP, Port: local.Port}
-	if err := sendReply(conn, successReply, &bind, req.Version); err != nil {
-		return fmt.Errorf("Failed to send reply: %v", err)
+	req.Headers.Address = bind
+	if err := sendReply(conn, successReply, req.Headers); err != nil {
+		return fmt.Errorf("failed to send reply: %v", err)
 	}
 
 	// Start proxying
@@ -250,204 +215,55 @@ func (s *Server) handleConnect(ctx context.Context, conn conn, req *Request) err
 	return nil
 }
 
+
+
+
 // handleBind is used to handle a connect command
-func (s *Server) handleBind(ctx context.Context, conn conn, req *Request) error {
+func (s *Server) handleBind(ctx context.Context, conn conn, req *Request)(err error) {
+	// newContext
 	// Check if this is allowed
 	if nctx, ok := s.config.Rules.Allow(ctx, req); !ok {
-		if err := sendReply(conn, ruleFailure, nil, req.Version); err != nil {
-			return fmt.Errorf("Failed to send reply: %v", err)
+		if err := sendReply(conn, ruleFailure, req.Headers); err != nil {
+			return fmt.Errorf("failed to send reply: %v", err)
 		}
-		return fmt.Errorf("Bind to %v blocked by rules", req.DestAddr)
+		return fmt.Errorf("bind to %v blocked by rules", req.DestAddr)
 	} else {
 		ctx = nctx
 	}
 
 	// TODO: Support bind
-	if err := sendReply(conn, commandNotSupported, nil, req.Version); err != nil {
-		return fmt.Errorf("Failed to send reply: %v", err)
+	if err := sendReply(conn, commandNotSupported, req.Headers); err != nil {
+		return fmt.Errorf("failed to send reply: %v", err)
 	}
 	return nil
 }
 
 // handleAssociate is used to handle a connect command
-func (s *Server) handleAssociate(ctx context.Context, conn conn, req *Request) error {
+func (s *Server) handleAssociate(ctx context.Context, conn conn, req *Request)(err error) {
 	// Check if this is allowed
 	if nctx, ok := s.config.Rules.Allow(ctx, req); !ok {
-		if err := sendReply(conn, ruleFailure, nil, req.Version); err != nil {
-			return fmt.Errorf("Failed to send reply: %v", err)
+		if err := sendReply(conn, ruleFailure,req.Headers); err != nil {
+			return fmt.Errorf("failed to send reply: %v", err)
 		}
-		return fmt.Errorf("Associate to %v blocked by rules", req.DestAddr)
+		return fmt.Errorf("associate to %v blocked by rules", req.DestAddr)
 	} else {
 		ctx = nctx
 	}
 
 	// TODO: Support associate
-	if err := sendReply(conn, commandNotSupported, nil, req.Version); err != nil {
-		return fmt.Errorf("Failed to send reply: %v", err)
+	if err := sendReply(conn, commandNotSupported, req.Headers); err != nil {
+		return fmt.Errorf("failed to send reply: %v", err)
 	}
 	return nil
-}
-
-// readAddrSpec is used to read AddrSpec.
-// Expects an address type byte, follwed by the address and port
-func readAddrSpec(r io.Reader) (*AddrSpec, error) {
-	d := &AddrSpec{}
-
-	// Get the address type
-	addrType := []byte{0}
-	if _, err := r.Read(addrType); err != nil {
-		return nil, err
-	}
-
-	// Handle on a per type basis
-	switch addrType[0] {
-	case ipv4Address:
-		addr := make([]byte, 4)
-		if _, err := io.ReadAtLeast(r, addr, len(addr)); err != nil {
-			return nil, err
-		}
-		d.IP = net.IP(addr)
-
-	case ipv6Address:
-		addr := make([]byte, 16)
-		if _, err := io.ReadAtLeast(r, addr, len(addr)); err != nil {
-			return nil, err
-		}
-		d.IP = net.IP(addr)
-
-	case fqdnAddress:
-		if _, err := r.Read(addrType); err != nil {
-			return nil, err
-		}
-		addrLen := int(addrType[0])
-		fqdn := make([]byte, addrLen)
-		if _, err := io.ReadAtLeast(r, fqdn, addrLen); err != nil {
-			return nil, err
-		}
-		d.FQDN = string(fqdn)
-
-	default:
-		return nil, unrecognizedAddrType
-	}
-
-	// Read the port
-	port := []byte{0, 0}
-	if _, err := io.ReadAtLeast(r, port, 2); err != nil {
-		return nil, err
-	}
-	d.Port = (int(port[0]) << 8) | int(port[1])
-
-	return d, nil
-}
-
-
-func addrSpecFromNetAddr(addr net.Addr) *AddrSpec {
-	if tcpAddr, ok := addr.(*net.TCPAddr); ok {
-		return &AddrSpec{IP: tcpAddr.IP, Port: tcpAddr.Port}
-	}
-	return nil
-}
-
-/* sendReply is used to send a reply message
-func sendReply(w io.Writer, resp uint8, addr *AddrSpec) error {
-	// Format the address
-	var addrType uint8
-	var addrBody []byte
-	var addrPort uint16
-	switch {
-	case addr == nil:
-		addrType = ipv4Address
-		addrBody = []byte{0, 0, 0, 0}
-		addrPort = 0
-
-	case addr.FQDN != "":
-		addrType = fqdnAddress
-		addrBody = append([]byte{byte(len(addr.FQDN))}, addr.FQDN...)
-		addrPort = uint16(addr.Port)
-
-	case addr.IP.To4() != nil:
-		addrType = ipv4Address
-		addrBody = []byte(addr.IP.To4())
-		addrPort = uint16(addr.Port)
-
-	case addr.IP.To16() != nil:
-		addrType = ipv6Address
-		addrBody = []byte(addr.IP.To16())
-		addrPort = uint16(addr.Port)
-*/
-// Expects port, follwed by the address
-func readAddrSpecv4(r io.Reader) (*AddrSpec, error) {
-	d := &AddrSpec{}
-	// Read the port
-	port := []byte{0, 0}
-	if _, err := io.ReadAtLeast(r, port, 2); err != nil {
-		return nil, err
-	}
-	d.Port = (int(port[0]) << 8) | int(port[1])
-
-	addr := []byte{0, 0, 0, 0}
-	if _, err := io.ReadAtLeast(r, addr, 4); err != nil {
-		return nil, err
-	}
-	d.IP = net.IP(addr)
-
-	return d, nil
 }
 
 // sendReply is used to send a reply message
-func sendReply(w io.Writer, resp uint8, addr *AddrSpec, version byte) error {
+func sendReply(w io.Writer, resp uint8, header Header) error {
 	var msg []byte
-	if version == socks5Version {
-		// Format the address
-		var addrType uint8
-		var addrBody []byte
-		var addrPort uint16
-		switch {
-		case addr == nil:
-			addrType = ipv4Address
-			addrBody = []byte{0, 0, 0, 0}
-			addrPort = 0
 
-		case addr.FQDN != "":
-			addrType = fqdnAddress
-			addrBody = append([]byte{byte(len(addr.FQDN))}, addr.FQDN...)
-			addrPort = uint16(addr.Port)
+		header.Command = resp
+		msg=header.Bytes()
 
-		case addr.IP.To4() != nil:
-			addrType = ipv4Address
-			addrBody = []byte(addr.IP.To4())
-			addrPort = uint16(addr.Port)
-
-		case addr.IP.To16() != nil:
-			addrType = ipv6Address
-			addrBody = []byte(addr.IP.To16())
-			addrPort = uint16(addr.Port)
-
-		default:
-			return fmt.Errorf("Failed to format address: %v", addr)
-		}
-
-		// Format the message
-		msg = make([]byte, 6+len(addrBody))
-		msg[0] = socks5Version
-		msg[1] = resp
-		msg[2] = 0 // Reserved
-		msg[3] = addrType
-		copy(msg[4:], addrBody)
-		msg[4+len(addrBody)] = byte(addrPort >> 8)
-		msg[4+len(addrBody)+1] = byte(addrPort & 0xff)
-	} else {
-		msg = make([]byte, 8)
-		msg[0] = 0
-		if resp == successReply {
-			msg[1] = 0x5a
-		} else {
-			msg[1] = 0x5b
-		}
-		// bytes 3-8 are reserved
-	}
-
-	// Send the message
 	_, err := w.Write(msg)
 	return err
 }

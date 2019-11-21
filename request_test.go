@@ -1,9 +1,8 @@
 package socks5
 
 import (
+	"bufio"
 	"bytes"
-	"encoding/binary"
-	"io"
 	"log"
 	"net"
 	"os"
@@ -29,24 +28,40 @@ func TestRequest_Connect(t *testing.T) {
 	if err != nil {
 		t.Fatalf("err: %v", err)
 	}
+	lAddr := l.Addr().(*net.TCPAddr)
+
+	// request header
+	header := Header{
+		Version:   socks5Version,
+		Command:   ConnectCommand,
+		Reserved:  uint8(0),
+		Address:   AddrSpec{
+			FQDN: "",
+			IP:  []byte{127, 0, 0, 1},
+			Port: lAddr.Port,
+		},
+		addrType:ipv4Address,
+	}
+
 	go func() {
 		conn, err := l.Accept()
 		if err != nil {
 			t.Fatalf("err: %v", err)
 		}
 		defer conn.Close()
-
-		buf := make([]byte, 4)
-		if _, err := io.ReadAtLeast(conn, buf, 4); err != nil {
+		r := bufio.NewReader(conn)
+		_,payload, err := Parse(r)
+		if err != nil {
 			t.Fatalf("err: %v", err)
 		}
-
-		if !bytes.Equal(buf, []byte("ping")) {
-			t.Fatalf("bad: %v", buf)
+		if !bytes.Equal(payload, []byte("ping")) {
+			t.Fatalf("bad: %v", payload)
 		}
-		conn.Write([]byte("pong"))
+		_,err = conn.Write([]byte("pong"))
+		if err != nil {
+			t.Fatalf("err: %v", err)
+		}
 	}()
-	lAddr := l.Addr().(*net.TCPAddr)
 
 	// Make server
 	s := &Server{config: &Config{
@@ -55,20 +70,16 @@ func TestRequest_Connect(t *testing.T) {
 		Logger:   log.New(os.Stdout, "", log.LstdFlags),
 	}}
 
-	// Create the connect request
+	// Load handlers
+	s.Load()
+
 	buf := bytes.NewBuffer(nil)
-	buf.Write([]byte{5, 1, 0, 1, 127, 0, 0, 1})
-
-	port := []byte{0, 0}
-	binary.BigEndian.PutUint16(port, uint16(lAddr.Port))
-	buf.Write(port)
-
-	// Send a ping
+	buf.Write(header.Bytes())
 	buf.Write([]byte("ping"))
 
 	// Handle the request
 	resp := &MockConn{}
-	req, err := NewRequest(buf, 5)
+	req, err := NewRequest(header,buf,AuthContext{})
 	if err != nil {
 		t.Fatalf("err: %v", err)
 	}
@@ -104,6 +115,18 @@ func TestRequest_Connect_RuleFail(t *testing.T) {
 	if err != nil {
 		t.Fatalf("err: %v", err)
 	}
+	lAddr := l.Addr().(*net.TCPAddr)
+	header := Header{
+		Version:   socks5Version,
+		Command:   ConnectCommand,
+		Reserved:  uint8(0),
+		Address:   AddrSpec{
+			FQDN: "",
+			IP:  []byte{127, 0, 0, 1},
+			Port: lAddr.Port,
+		},
+		addrType:ipv4Address,
+	}
 	go func() {
 		conn, err := l.Accept()
 		if err != nil {
@@ -111,17 +134,19 @@ func TestRequest_Connect_RuleFail(t *testing.T) {
 		}
 		defer conn.Close()
 
-		buf := make([]byte, 4)
-		if _, err := io.ReadAtLeast(conn, buf, 4); err != nil {
+		r := bufio.NewReader(conn)
+		_,payload, err := Parse(r)
+		if err != nil {
 			t.Fatalf("err: %v", err)
 		}
-
-		if !bytes.Equal(buf, []byte("ping")) {
-			t.Fatalf("bad: %v", buf)
+		if !bytes.Equal(payload, []byte("ping")) {
+			t.Fatalf("bad: %v", payload)
 		}
-		conn.Write([]byte("pong"))
+		_,err = conn.Write([]byte("pong"))
+		if err != nil {
+			t.Fatalf("err: %v", err)
+		}
 	}()
-	lAddr := l.Addr().(*net.TCPAddr)
 
 	// Make server
 	s := &Server{config: &Config{
@@ -130,20 +155,19 @@ func TestRequest_Connect_RuleFail(t *testing.T) {
 		Logger:   log.New(os.Stdout, "", log.LstdFlags),
 	}}
 
+	//Load handlers
+	s.Load()
+
 	// Create the connect request
 	buf := bytes.NewBuffer(nil)
-	buf.Write([]byte{5, 1, 0, 1, 127, 0, 0, 1})
-
-	port := []byte{0, 0}
-	binary.BigEndian.PutUint16(port, uint16(lAddr.Port))
-	buf.Write(port)
+	buf.Write(header.Bytes())
 
 	// Send a ping
 	buf.Write([]byte("ping"))
 
 	// Handle the request
 	resp := &MockConn{}
-	req, err := NewRequest(buf, 5)
+	req, err := NewRequest(header,buf,AuthContext{})
 	if err != nil {
 		t.Fatalf("err: %v", err)
 	}
@@ -159,11 +183,9 @@ func TestRequest_Connect_RuleFail(t *testing.T) {
 		2,
 		0,
 		1,
-		0, 0, 0, 0,
-		0, 0,
 	}
 
-	if !bytes.Equal(out, expected) {
+	if !bytes.Equal(out[:4], expected) {
 		t.Fatalf("bad: %v %v", out, expected)
 	}
 }
